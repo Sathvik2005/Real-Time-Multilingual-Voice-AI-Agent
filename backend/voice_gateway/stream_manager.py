@@ -54,24 +54,59 @@ class StreamManager:
 
     # ── Initialisation ────────────────────────────────────────────────────
 
-    async def initialise(self, patient_name: Optional[str] = None) -> Optional[int]:
-        """Create or resume a session. Returns the patient_id if one was resolved."""
+    async def initialise(
+        self,
+        patient_name: Optional[str] = None,
+        patient_phone: Optional[str] = None,
+        preferred_language: Optional[str] = None,
+    ) -> tuple[Optional[int], str]:
+        """
+        Create or resume a session.
+
+        Returns:
+          (patient_id, active_language)
+        """
+        normalized_lang = (preferred_language or "").strip().lower() or None
+
         if not await self._store.session_exists(self.session_id):
-            await self._store.create_session(self.session_id)
+            await self._store.create_session(
+                self.session_id,
+                language=normalized_lang or "en",
+            )
             logger.info("New session initialised", session_id=self.session_id)
 
-        patient_id: Optional[int] = None
+        active_language = normalized_lang or await self._store.get_language(self.session_id)
+        patient_id: Optional[int] = await self._store.get_patient_id(self.session_id)
+
         if patient_name:
             # Use a dedicated short-lived session for this write
             factory = get_session_factory()
             async with factory() as db:
-                patient = await crud.get_or_create_patient(db, name=patient_name)
+                patient = await crud.get_or_create_patient(
+                    db,
+                    name=patient_name,
+                    phone=patient_phone,
+                    preferred_language=active_language,
+                )
+
+                # Explicit user preference should override previously stored language.
+                if normalized_lang and patient.preferred_language != normalized_lang:
+                    patient.preferred_language = normalized_lang
+
                 await db.commit()
+
                 await self._store.set_patient(
-                    self.session_id, patient.patient_id, patient.name
+                    self.session_id,
+                    patient.patient_id,
+                    patient.name,
                 )
                 patient_id = patient.patient_id
-        return patient_id
+
+                # Carry language preference across sessions for returning patients.
+                active_language = normalized_lang or patient.preferred_language or active_language
+
+        await self._store.set_language(self.session_id, active_language)
+        return patient_id, active_language
 
     # ── Barge-in ──────────────────────────────────────────────────────────
 

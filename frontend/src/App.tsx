@@ -13,8 +13,30 @@ function App() {
     return params.get('name') ?? 'Guest Patient';
   });
 
-  const { status, error, clearError, sessionId, detectedLanguage, latencyMetrics } = useAgentStore();
-  const { isInitialized, startRecording, stopRecording, sendText } = useVoiceAgent(patientName);
+  const [patientPhone] = useState<string | undefined>(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get('phone') ?? undefined;
+  });
+
+  const [preferredLanguage] = useState<string | undefined>(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get('lang') ?? undefined;
+  });
+
+  const {
+    status,
+    error,
+    clearError,
+    sessionId,
+    detectedLanguage,
+    latencyMetrics,
+    ttsFallbackActive,
+  } = useAgentStore();
+  const { isInitialized, startRecording, stopRecording, sendText } = useVoiceAgent({
+    name: patientName,
+    phone: patientPhone,
+    preferredLanguage,
+  });
 
   const isConnecting = !isInitialized || status === 'idle' || status === 'connecting';
 
@@ -40,6 +62,12 @@ function App() {
           <button type="button" onClick={clearError} aria-label="Dismiss error">
             x
           </button>
+        </div>
+      )}
+
+      {ttsFallbackActive && (
+        <div className="app-notice-banner" role="status" aria-live="polite">
+          Backend TTS is unavailable. Using browser voice fallback for this session.
         </div>
       )}
 

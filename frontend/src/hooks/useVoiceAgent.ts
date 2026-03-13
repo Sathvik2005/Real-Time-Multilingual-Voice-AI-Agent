@@ -23,6 +23,10 @@ class AudioQueue {
     this.chunks.push(new Uint8Array(chunk));
   }
 
+  hasBufferedAudio(): boolean {
+    return this.chunks.length > 0;
+  }
+
   // Called when audio_end arrives — decode the full concatenated MP3 and play it.
   async flush(): Promise<void> {
     if (this.chunks.length === 0) return;
@@ -62,7 +66,43 @@ class AudioQueue {
 
 const audioQueue = new AudioQueue();
 
-export function useVoiceAgent(patientName: string) {
+interface PatientInitInfo {
+  name: string;
+  phone?: string;
+  preferredLanguage?: string;
+}
+
+const SPEECH_LANG_MAP: Record<string, string> = {
+  en: 'en-US',
+  hi: 'hi-IN',
+  ta: 'ta-IN',
+};
+
+function stopBrowserSpeech() {
+  if ('speechSynthesis' in window) {
+    window.speechSynthesis.cancel();
+  }
+}
+
+function speakWithBrowser(text: string, languageCode?: string): Promise<void> {
+  if (!text.trim() || !('speechSynthesis' in window)) {
+    return Promise.resolve();
+  }
+
+  stopBrowserSpeech();
+
+  return new Promise((resolve) => {
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = SPEECH_LANG_MAP[languageCode ?? ''] ?? 'en-US';
+    utterance.rate = 1;
+    utterance.pitch = 1;
+    utterance.onend = () => resolve();
+    utterance.onerror = () => resolve();
+    window.speechSynthesis.speak(utterance);
+  });
+}
+
+export function useVoiceAgent(patient: PatientInitInfo) {
   const {
     sessionId,
     status,
@@ -76,11 +116,14 @@ export function useVoiceAgent(patientName: string) {
     setDetectedLanguage,
     setLatencyMetrics,
     setToolCallsTrace,
+    setTtsFallbackActive,
   } = useAgentStore();
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const isRecordingRef = useRef(false);
+  const lastAgentTextRef = useRef('');
+  const receivedBackendAudioRef = useRef(false);
   const [isInitialized, setIsInitialized] = useState(false);
   // Synchronous guard prevents StrictMode's double-invocation from creating two sessions
   const initStartedRef = useRef(false);
@@ -136,10 +179,13 @@ export function useVoiceAgent(patientName: string) {
 
         case 'agent_text': {
           if (msg.is_final) {
+            const agentText = (msg.text as string) || '';
+            lastAgentTextRef.current = agentText;
+            receivedBackendAudioRef.current = false;
             addMessage({
               id: newMsgId(),
               role: 'agent',
-              text: (msg.text as string) || '',
+              text: agentText,
               timestamp: new Date(),
               language: useAgentStore.getState().detectedLanguage?.code,
             });
@@ -152,6 +198,7 @@ export function useVoiceAgent(patientName: string) {
           const b64 = (msg.data as string) || '';
           if (b64) {
             try {
+              receivedBackendAudioRef.current = true;
               const binary = atob(b64);
               const bytes = new Uint8Array(binary.length);
               for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
@@ -164,8 +211,17 @@ export function useVoiceAgent(patientName: string) {
         }
 
         case 'audio_end': {
-          // Flush triggers full-buffer decode+playback; set ready after it finishes
-          audioQueue.flush().then(() => setTimeout(() => setStatus('ready'), 100));
+          const detectedLanguageCode = useAgentStore.getState().detectedLanguage?.code;
+          const finalize = () => setTimeout(() => setStatus('ready'), 100);
+
+          // Prefer provider audio when available; otherwise fall back to browser speech.
+          if (audioQueue.hasBufferedAudio() || receivedBackendAudioRef.current) {
+            setTtsFallbackActive(false);
+            audioQueue.flush().then(finalize);
+          } else {
+            setTtsFallbackActive(true);
+            speakWithBrowser(lastAgentTextRef.current, detectedLanguageCode).then(finalize);
+          }
           break;
         }
 
@@ -193,7 +249,7 @@ export function useVoiceAgent(patientName: string) {
         }
       }
     },
-    [addMessage, clearTranscript, setDetectedLanguage, setError, setLatencyMetrics, setStatus, setTranscript, setToolCallsTrace]
+    [addMessage, clearTranscript, setDetectedLanguage, setError, setLatencyMetrics, setStatus, setTranscript, setToolCallsTrace, setTtsFallbackActive]
   );
 
   // ── WebSocket ──────────────────────────────────────────────────────────
@@ -204,8 +260,13 @@ export function useVoiceAgent(patientName: string) {
     sessionId,
     onMessage: handleServerMessage,
     onOpen: () => {
-      if (patientName && sendRef.current) {
-        sendRef.current({ type: 'init', patient_name: patientName });
+      if (patient.name && sendRef.current) {
+        sendRef.current({
+          type: 'init',
+          patient_name: patient.name,
+          patient_phone: patient.phone,
+          preferred_language: patient.preferredLanguage,
+        });
       }
     },
     onClose: () => {
@@ -241,6 +302,7 @@ export function useVoiceAgent(patientName: string) {
 
     // Interrupt any TTS playback (barge-in)
     audioQueue.clear();
+    stopBrowserSpeech();
     send({ type: 'interrupt' });
 
     try {

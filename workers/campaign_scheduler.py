@@ -12,11 +12,21 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import List
+from typing import Dict, List
 
 from workers.celery_app import app as celery_app
+from backend.services.translation import translation_service
 
 logger = logging.getLogger(__name__)
+
+
+def _simulate_patient_outcome(appointment_id: int) -> str:
+    """
+    Simulate an outbound campaign response for demo/testing purposes.
+    Outcomes are deterministic so replaying the same campaign is reproducible.
+    """
+    outcomes = ["confirmed", "reschedule_requested", "cancel_requested", "polite_rejection"]
+    return outcomes[appointment_id % len(outcomes)]
 
 
 @celery_app.task(bind=True, name="workers.campaign_scheduler.run_campaign")
@@ -39,6 +49,7 @@ def run_campaign(self, campaign_id: int) -> dict:
 
 async def _run_campaign_async(campaign_id: int) -> dict:
     from sqlalchemy import select, update
+    from sqlalchemy.orm import selectinload
 
     from backend.database.connection import get_session_factory
     from backend.database.models import Appointment, Campaign, CampaignStatus, Patient
@@ -68,10 +79,22 @@ async def _run_campaign_async(campaign_id: int) -> dict:
 
         appointment_ids: List[int] = json.loads(campaign.appointment_ids or "[]")
         sent = 0
+        language_counts: Dict[str, int] = {}
+        outcome_counts: Dict[str, int] = {
+            "confirmed": 0,
+            "reschedule_requested": 0,
+            "cancel_requested": 0,
+            "polite_rejection": 0,
+        }
 
         for appt_id in appointment_ids:
             result = await db.execute(
                 select(Appointment)
+                .options(
+                    selectinload(Appointment.patient),
+                    selectinload(Appointment.doctor),
+                    selectinload(Appointment.slot),
+                )
                 .join(Patient)
                 .join(Slot)
                 .join(Doctor)
@@ -81,8 +104,8 @@ async def _run_campaign_async(campaign_id: int) -> dict:
             if not appt:
                 continue
 
-            # Build reminder message from template
-            message = campaign.message_template.format(
+            # Build reminder/follow-up message from template
+            base_message = campaign.message_template.format(
                 patient_name=appt.patient.name if appt.patient else "Patient",
                 doctor_name=appt.doctor.name if appt.doctor else "Doctor",
                 appointment_time=(
@@ -92,6 +115,21 @@ async def _run_campaign_async(campaign_id: int) -> dict:
                 ),
             )
 
+            preferred_language = (
+                (appt.patient.preferred_language if appt.patient else None) or "en"
+            ).lower()
+
+            localized_message = base_message
+            if preferred_language != "en":
+                localized_message = await translation_service.from_english(
+                    base_message,
+                    target=preferred_language,
+                )
+
+            simulated_outcome = _simulate_patient_outcome(appt_id)
+            outcome_counts[simulated_outcome] = outcome_counts.get(simulated_outcome, 0) + 1
+            language_counts[preferred_language] = language_counts.get(preferred_language, 0) + 1
+
             # In a real deployment this would call the TTS pipeline and
             # dial the patient via a telephony API (Twilio, AWS Connect, etc.)
             logger.info(
@@ -99,7 +137,9 @@ async def _run_campaign_async(campaign_id: int) -> dict:
                 campaign=campaign.name,
                 appointment_id=appt_id,
                 patient=appt.patient.name if appt.patient else "?",
-                message=message[:80],
+                language=preferred_language,
+                simulated_outcome=simulated_outcome,
+                message=localized_message[:120],
             )
             sent += 1
 
@@ -114,7 +154,12 @@ async def _run_campaign_async(campaign_id: int) -> dict:
         )
         await db.commit()
 
-    return {"campaign_id": campaign_id, "reminders_sent": sent}
+    return {
+        "campaign_id": campaign_id,
+        "reminders_sent": sent,
+        "language_breakdown": language_counts,
+        "outcome_breakdown": outcome_counts,
+    }
 
 
 @celery_app.task(name="workers.campaign_scheduler.cleanup_stale_campaigns")

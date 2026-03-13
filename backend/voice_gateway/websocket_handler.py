@@ -156,7 +156,22 @@ class VoiceWebSocketHandler:
 
     async def _handle_init(self, data: Dict[str, Any]) -> None:
         patient_name = data.get("patient_name") or "Guest"
-        patient_id = await self._stream_manager.initialise(patient_name=patient_name)
+        patient_phone = data.get("patient_phone") or None
+        preferred_language = data.get("preferred_language") or None
+
+        patient_id, active_language = await self._stream_manager.initialise(
+            patient_name=patient_name,
+            patient_phone=patient_phone,
+            preferred_language=preferred_language,
+        )
+
+        await self._ws.send_json(
+            {
+                "type": "language_detected",
+                "code": active_language,
+                "name": language_detector.display_name(active_language),
+            }
+        )
 
         await self._ws.send_json(
             {
@@ -166,7 +181,13 @@ class VoiceWebSocketHandler:
                 "message": f"Hello {patient_name}, how can I help you today?",
             }
         )
-        logger.info("Session initialised", session_id=self.session_id, patient=patient_name)
+        logger.info(
+            "Session initialised",
+            session_id=self.session_id,
+            patient=patient_name,
+            has_phone=bool(patient_phone),
+            language=active_language,
+        )
 
     # ── Audio – batch processing ──────────────────────────────────────────
 

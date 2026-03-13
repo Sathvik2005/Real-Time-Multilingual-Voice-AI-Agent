@@ -36,6 +36,7 @@ interface AgentStore {
 
   // UI
   isVoiceMode: boolean;
+  ttsFallbackActive: boolean;
 
   // Actions
   setSessionId: (id: string) => void;
@@ -53,6 +54,7 @@ interface AgentStore {
   setLatencyMetrics: (metrics: LatencyMetrics) => void;
   setToolCallsTrace: (calls: ToolCallEntry[]) => void;
   setVoiceMode: (value: boolean) => void;
+  setTtsFallbackActive: (value: boolean) => void;
 }
 
 export const useAgentStore = create<AgentStore>((set) => ({
@@ -68,6 +70,7 @@ export const useAgentStore = create<AgentStore>((set) => ({
   latencyMetrics: null,
   toolCallsTrace: [],
   isVoiceMode: true,
+  ttsFallbackActive: false,
 
   setSessionId: (id) => set({ sessionId: id }),
   setPatientId: (id) => set({ patientId: id }),
@@ -87,4 +90,5 @@ export const useAgentStore = create<AgentStore>((set) => ({
   setLatencyMetrics: (metrics) => set({ latencyMetrics: metrics }),
   setToolCallsTrace: (calls) => set({ toolCallsTrace: calls }),
   setVoiceMode: (value) => set({ isVoiceMode: value }),
+  setTtsFallbackActive: (value) => set({ ttsFallbackActive: value }),
 }));
