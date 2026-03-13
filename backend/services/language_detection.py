@@ -8,8 +8,8 @@ the project.
 
 from __future__ import annotations
 
-from functools import lru_cache
 from typing import Dict, Optional
+import re
 
 import structlog
 from langdetect import LangDetectException, detect, detect_langs
@@ -48,6 +48,45 @@ DEFAULT_LANGUAGE = "en"
 class LanguageDetector:
 
     @staticmethod
+    def _looks_like_english(text: str) -> bool:
+        """
+        Heuristic guard for short Latin-script appointment requests.
+        langdetect is overly aggressive on these and often returns French.
+        """
+        normalized = text.strip().lower()
+        if not normalized:
+            return False
+
+        if not re.fullmatch(r"[a-z0-9\s.,!?'-]+", normalized):
+            return False
+
+        english_markers = {
+            "appointment",
+            "doctor",
+            "doctors",
+            "book",
+            "booking",
+            "reschedule",
+            "cancel",
+            "available",
+            "availability",
+            "slot",
+            "slots",
+            "tomorrow",
+            "today",
+            "evening",
+            "morning",
+            "afternoon",
+            "cardiologist",
+            "dermatologist",
+            "physician",
+            "clinic",
+            "list",
+        }
+        words = set(re.findall(r"[a-z']+", normalized))
+        return bool(words & english_markers)
+
+    @staticmethod
     def detect(text: str, min_length: int = 5) -> str:
         """
         Return a BCP-47 language code for ``text``.
@@ -56,6 +95,10 @@ class LanguageDetector:
         """
         if not text or len(text.strip()) < min_length:
             return DEFAULT_LANGUAGE
+
+        if LanguageDetector._looks_like_english(text):
+            logger.debug("Language heuristic matched English", preview=text[:60])
+            return "en"
 
         try:
             candidates = detect_langs(text)
