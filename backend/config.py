@@ -69,6 +69,14 @@ class Settings(BaseSettings):
     ELEVENLABS_VOICE_ID: str = "21m00Tcm4TlvDq8ikWAM"
     ELEVENLABS_MODEL_ID: str = "eleven_multilingual_v2"
 
+    # ── TTS Provider Fallback ───────────────────────────────────────────
+    # auto: ElevenLabs first, fallback to OpenAI TTS
+    # elevenlabs: force ElevenLabs only
+    # openai: force OpenAI TTS only
+    TTS_PROVIDER: str = "auto"
+    OPENAI_TTS_MODEL: str = "gpt-4o-mini-tts"
+    OPENAI_TTS_VOICE: str = "alloy"
+
     # ── Translation ──────────────────────────────────────────────────────
     LIBRETRANSLATE_URL: str = "https://libretranslate.com"
     LIBRETRANSLATE_API_KEY: str = ""
