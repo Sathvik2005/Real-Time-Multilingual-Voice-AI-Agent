@@ -5,6 +5,7 @@ Stream manager — coordinates the STT → Agent → TTS pipeline per session.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import Any, Callable, Coroutine, Dict, Optional
 
@@ -121,6 +122,142 @@ class StreamManager:
         async with self._agent_lock:
             await self._run_pipeline(text, asr_ms=asr_ms)
 
+    async def _local_rule_based_response(
+        self,
+        db,
+        user_text: str,
+        patient_id: Optional[int],
+    ) -> str:
+        """Fallback conversational planner when external LLM keys are unavailable."""
+        text = (user_text or "").strip()
+        low = text.lower()
+
+        # Appointment mutations by explicit IDs
+        if patient_id and (m := re.search(r"\bbook\s+slot\s+(\d+)\b", low)):
+            slot_id = int(m.group(1))
+            slot = await crud.get_slot_by_id(db, slot_id)
+            if not slot:
+                return f"I could not find slot {slot_id}. Please ask me to list available slots first."
+            try:
+                appt = await crud.create_appointment(
+                    db,
+                    patient_id=patient_id,
+                    doctor_id=slot.doctor_id,
+                    slot_id=slot_id,
+                    reason="Booked via fallback assistant",
+                )
+                doctor = await crud.get_doctor_by_id(db, slot.doctor_id)
+                await db.commit()
+                return (
+                    f"Appointment booked successfully. Appointment ID {appt.appointment_id} with "
+                    f"Dr. {doctor.name if doctor else 'the doctor'} at "
+                    f"{slot.start_time.strftime('%A, %d %B at %I:%M %p')}."
+                )
+            except Exception as exc:  # noqa: BLE001
+                await db.rollback()
+                return f"I could not book slot {slot_id}: {str(exc)}"
+
+        if patient_id and (m := re.search(r"\bcancel\s+appointment\s+(\d+)\b", low)):
+            appt_id = int(m.group(1))
+            try:
+                await crud.cancel_appointment(db, appt_id, patient_id)
+                await db.commit()
+                return f"Appointment {appt_id} has been cancelled."
+            except Exception as exc:  # noqa: BLE001
+                await db.rollback()
+                return f"I could not cancel appointment {appt_id}: {str(exc)}"
+
+        if patient_id and (m := re.search(r"\breschedule\s+appointment\s+(\d+)\s+to\s+slot\s+(\d+)\b", low)):
+            appt_id = int(m.group(1))
+            slot_id = int(m.group(2))
+            try:
+                appt = await crud.reschedule_appointment(db, appt_id, patient_id, slot_id)
+                slot = await crud.get_slot_by_id(db, slot_id)
+                await db.commit()
+                return (
+                    f"Appointment {appt.appointment_id} has been rescheduled to "
+                    f"{slot.start_time.strftime('%A, %d %B at %I:%M %p') if slot else f'slot {slot_id}'}."
+                )
+            except Exception as exc:  # noqa: BLE001
+                await db.rollback()
+                return f"I could not reschedule appointment {appt_id}: {str(exc)}"
+
+        # Read-only intents
+        if "specialization" in low or "specialisation" in low:
+            doctors = await crud.list_all_doctors(db)
+            specs = sorted({d.specialization for d in doctors})
+            return "Available specializations: " + ", ".join(specs[:15])
+
+        if "doctor" in low or "doctors" in low:
+            doctors = await crud.list_all_doctors(db)
+            if not doctors:
+                return "No doctors are currently available in the system."
+            lines = [
+                f"{d.doctor_id}. Dr. {d.name} - {d.specialization}"
+                for d in doctors[:12]
+            ]
+            return "Available doctors:\n" + "\n".join(lines)
+
+        if patient_id and ("my appointments" in low or "list appointments" in low):
+            appts = await crud.get_patient_appointments(db, patient_id)
+            if not appts:
+                return "You have no upcoming appointments."
+            lines = [
+                f"{a.appointment_id}: Dr. {a.doctor.name if a.doctor else 'Unknown'} on "
+                f"{a.slot.start_time.strftime('%A, %d %B at %I:%M %p') if a.slot else 'N/A'} ({a.status.value})"
+                for a in appts[:10]
+            ]
+            return "Your upcoming appointments:\n" + "\n".join(lines)
+
+        if "book" in low or "appointment" in low or "slot" in low:
+            spec_keywords = {
+                "cardio": "Cardiology",
+                "heart": "Cardiology",
+                "derma": "Dermatology",
+                "skin": "Dermatology",
+                "neuro": "Neurology",
+                "brain": "Neurology",
+                "pediatric": "Pediatrics",
+                "child": "Pediatrics",
+                "ortho": "Orthopedics",
+                "bone": "Orthopedics",
+                "ent": "ENT",
+            }
+            specialization = ""
+            for k, v in spec_keywords.items():
+                if k in low:
+                    specialization = v
+                    break
+
+            doctors = (
+                await crud.search_doctors(db, specialization=specialization)
+                if specialization
+                else await crud.list_all_doctors(db)
+            )
+            if not doctors:
+                return "I could not find matching doctors. Ask me to list available doctors first."
+
+            doctor = doctors[0]
+            slots = await crud.get_available_slots(db, doctor.doctor_id, limit=5)
+            if not slots:
+                return f"Dr. {doctor.name} currently has no available slots. Try another specialization."
+
+            slot_lines = [
+                f"slot {s.slot_id}: {s.start_time.strftime('%A, %d %B at %I:%M %p')}"
+                for s in slots
+            ]
+            return (
+                f"I found availability with Dr. {doctor.name} ({doctor.specialization}).\n"
+                + "\n".join(slot_lines)
+                + "\nTo confirm, say: book slot <slot_id>."
+            )
+
+        return (
+            "I'm running in local fallback mode because LLM credentials are unavailable. "
+            "You can ask me to list doctors, list specializations, book slot <id>, "
+            "cancel appointment <id>, or reschedule appointment <id> to slot <id>."
+        )
+
     # ── Pipeline ──────────────────────────────────────────────────────────
 
     async def _run_pipeline(self, user_text: str, asr_ms: float = 0.0) -> None:
@@ -184,13 +321,26 @@ class StreamManager:
                         "Please check the OpenAI billing and add credits, "
                         "or configure a Groq API key in the .env file."
                     )
-                elif "authentication" in error_str or "401" in error_str or "api key" in error_str:
-                    user_msg = "I'm sorry, the AI service API key is invalid. Please check the configuration."
                 elif "timeout" in error_str or "timed out" in error_str:
                     user_msg = "I'm sorry, the request timed out. Please try again."
+                elif "authentication" in error_str or "401" in error_str or "api key" in error_str:
+                    user_msg = await self._local_rule_based_response(db, user_text, patient_id)
                 else:
                     user_msg = "I'm sorry, I encountered an error. Please try again."
                 await self._on_text_event(user_msg, True)
+                if "authentication" in error_str or "401" in error_str or "api key" in error_str:
+                    # Continue to TTS so voice UX remains intact in fallback mode.
+                    self._tts_task = asyncio.create_task(
+                        self._stream_tts(user_msg, language, llm_ms=0.0, asr_ms=asr_ms)
+                    )
+                    try:
+                        await self._tts_task
+                    except Exception as tts_exc:  # noqa: BLE001
+                        logger.error("Fallback TTS failed", error=str(tts_exc), session_id=self.session_id)
+                        if self._on_audio_end:
+                            await self._on_audio_end()
+                    return
+
                 # Send audio_end so the frontend can accept new input (not stuck in 'speaking')
                 if self._on_audio_end:
                     await self._on_audio_end()
